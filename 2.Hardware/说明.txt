@@ -1,0 +1,6 @@
+ProPrj_轮腿机器人-世博同学-正式版 是工程文件，可以用立创ED标准打开！
+这四个是打样文件，厚度1.6mm，单套需要 Gerber_PCB_Encoder的数量为2，别的数量为1。
+Gerber_PCB_Encoder
+Gerber_PCB_IMU_Board
+Gerber_PCB_ServoDebug(可不打)
+Gerber_PCB_WLRobot

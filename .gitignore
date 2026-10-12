@@ -1,0 +1,23 @@
+# 固件工程自身有独立 Git 仓库，外层仓库只保存项目资料和入口文档。
+robotcat-firmware/.git/
+robotcat-firmware/.pio/
+robotcat-firmware/lib/
+robotcat-firmware/src/
+robotcat-firmware/include/
+robotcat-firmware/test/
+robotcat-firmware/.vscode/
+robotcat-firmware/
+*.rar
+*.zip
+~$*
+.workbuddy/
+_ref_orig/
+_ref_pcb/
+
+# 外层工程中的临时构建输出
+s3-voice/.pio/
+s3-voice/*.log
+s3-voice/*-now.txt
+s3-voice/pnp-*.txt
+3.Software/Vscode/Vscode-Shibo-Robot-PIOProj-main/
+

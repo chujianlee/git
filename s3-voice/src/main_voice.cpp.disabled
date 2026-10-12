@@ -1,0 +1,441 @@
+// ESP32-S3 语音模块 —— 出声验证固件 v4
+//
+// 【重要发现】这块板上 LEDC(PWM) 外设没有信号输出（自检实测：软件翻转能读到 400 次跳变，
+//             LEDC 全频率 0 次）。所以本固件改用「软件翻转 GPIO」产生方波驱动蜂鸣器。
+//
+// 【更重要】这个模块本身没有喇叭！GPIO4 只输出电信号，必须外接蜂鸣器/耳机才能变成声音。
+//
+// 接线（任选其一）：
+//   1) 无源蜂鸣器 / 压电片：正极 -> GPIO4，负极 -> GND          （推荐，最响）
+//   2) 手机耳机：插头尖端串 100Ω -> GPIO4，插头尾端金属套 -> GND
+//   3) 有源蜂鸣器：正极 -> GPIO4，负极 -> GND，然后串口发 H（给直流，不给方波）
+//
+// 串口命令（115200，记得勾选「发送新行」）：
+//   X  自检 —— 不需要接任何东西，证明 GPIO4 真的在振荡
+//   T  播放开机旋律 C5-E5-G5-C6
+//   B  两声短促高音
+//   L  10 秒 1000Hz 长音（可发任意字符提前中断）
+//   S  扫频 200Hz -> 4000Hz
+//   H  GPIO4 恒定 3.3V 直流 4 秒 —— 有源蜂鸣器用这个
+//   A  自动循环开关（默认开，每 8 秒播一次）
+//   I  芯片信息
+//   ?  帮助
+
+#include <Arduino.h>
+#include <Wire.h>
+
+#define SPEAKER_PIN 4      // 输出音频方波
+#define STATUS_LED  2      // 板载 LED
+
+static void toneBegin();   // 前向声明（定义在下面）
+
+// ============================================================ I2C 扫描
+// 网上查到的常见 ESP32-S3 音频板 I2C 引脚组合，逐个试，看板上到底焊了什么芯片。
+// ES8311 = 0x18（音频 codec，能放音）/ ES7210 = 0x40（麦克风 ADC）/ PCF85063 = 0x51（RTC）
+static const struct { uint8_t sda, scl; } kI2CPairs[] = {
+  {8,9},{8,18},{18,8},{17,18},{18,17},{10,11},{11,10},{47,48},{48,47},
+  {38,39},{39,38},{41,40},{40,41},{1,2},{2,1},{4,5},{5,4},{6,7},{7,6},
+  {12,13},{13,12},{14,15},{15,14},{16,17},{35,36},{3,4},{45,46},{9,8}
+};
+
+// 只探这几个关键地址，不扫全部 112 个 —— 否则单次扫描要好几分钟
+static const uint8_t kKeyAddr[] = {
+  0x18,   // ES8311 audio codec
+  0x10, 0x11, 0x1A,  // ES8388 / WM8978
+  0x40, 0x41, 0x20,  // ES7210 mic ADC / TCA9555
+  0x51,   // PCF85063 RTC
+  0x68,   // IMU
+  0x70    // SHTC3
+};
+
+static const char* chipName(uint8_t a)
+{
+  switch (a)
+  {
+    case 0x18: return "ES8311 audio codec  <== CAN PLAY SOUND";
+    case 0x10: return "ES8388 / WM8978 class codec";
+    case 0x11: return "ES8388 alt addr";
+    case 0x40: return "ES7210 mic ADC (4ch)";
+    case 0x41: return "ES7210 alt / TCA9555";
+    case 0x20: return "TCA9555 GPIO expander / ES7210";
+    case 0x51: return "PCF85063 RTC";
+    case 0x68: return "ICM-42607 / MPU6050 IMU";
+    case 0x70: return "SHTC3 temp/humidity";
+    case 0x1A: return "WM8978 codec";
+    default:   return "";
+  }
+}
+
+// 软件 I2C 探测（Wire 库在空总线上会等超时，一组就要 10 秒，不能用）
+// 发 START + 地址字节 + 读 ACK + STOP，靠开漏 + 内部上拉，每次约 100us。
+// 用「切方向」模拟开漏：拉低=输出0，释放=切输入+上拉。比 INPUT_OUTPUT_OD 可靠。
+static inline void busLow(gpio_num_t p)
+{
+  gpio_set_direction(p, GPIO_MODE_OUTPUT);
+  gpio_set_level(p, 0);
+}
+static inline void busRelease(gpio_num_t p)
+{
+  gpio_pullup_en(p);
+  gpio_set_direction(p, GPIO_MODE_INPUT);
+}
+static inline bool busRead(gpio_num_t p)
+{
+  return gpio_get_level(p) != 0;
+}
+
+static bool i2cProbe(uint8_t sdaPin, uint8_t sclPin, uint8_t addr)
+{
+  const gpio_num_t sda = (gpio_num_t)sdaPin;
+  const gpio_num_t scl = (gpio_num_t)sclPin;
+
+  gpio_reset_pin(sda); gpio_reset_pin(scl);
+  busRelease(sda); busRelease(scl);
+  delayMicroseconds(30);
+
+  busLow(sda);      delayMicroseconds(5);            // START
+  busLow(scl);      delayMicroseconds(5);
+
+  for (int i = 7; i >= 0; i--)                       // 7bit 地址 + W(0)
+  {
+    if ((addr >> i) & 1) busRelease(sda); else busLow(sda);
+    delayMicroseconds(3);
+    busRelease(scl); delayMicroseconds(3);
+    busLow(scl);     delayMicroseconds(3);
+  }
+
+  busRelease(sda);  delayMicroseconds(3);            // 读 ACK（SDA 被拉低即有设备）
+  busRelease(scl);  delayMicroseconds(4);
+  const bool ack = !busRead(sda);
+  busLow(scl);      delayMicroseconds(3);
+
+  busLow(sda);      delayMicroseconds(3);            // STOP
+  busRelease(scl);  delayMicroseconds(3);
+  busRelease(sda);  delayMicroseconds(5);
+
+  return ack;
+}
+
+static void scanI2C()
+{
+  Serial.println("\n===== I2C SCAN (what chips are on this board?) =====");
+  const uint32_t t0 = millis();
+  int total = 0;
+
+  for (auto &p : kI2CPairs)
+  {
+    // 阴性对照：0x00 是通用广播地址，正常总线上不该有设备应答。
+    // 如果它也返回 ACK，说明这组引脚上探测不可信（浮空/上拉不足），跳过。
+    if (i2cProbe(p.sda, p.scl, 0x00))
+    {
+      Serial.printf("[i2c] SDA=%2d SCL=%2d  SANITY FAIL (unreliable, skipped)\n", p.sda, p.scl);
+      continue;
+    }
+
+    bool found = false;
+    for (uint8_t k = 0; k < sizeof(kKeyAddr); k++)
+    {
+      const uint8_t a = kKeyAddr[k];
+      if (i2cProbe(p.sda, p.scl, a))
+      {
+        found = true;
+        total++;
+        Serial.printf("[i2c] SDA=%2d SCL=%2d -> 0x%02X  %s\n", p.sda, p.scl, a, chipName(a));
+      }
+    }
+    Serial.printf("[i2c] SDA=%2d SCL=%2d  %s\n", p.sda, p.scl, found ? "HIT" : "-");
+  }
+
+  if (total == 0)
+    Serial.println("[i2c] NO I2C device found -> no onboard codec, must attach external buzzer");
+  Serial.printf("[i2c] scan done, %d device(s), %lu ms\n\n", total, (unsigned long)(millis() - t0));
+
+  toneBegin();   // 扫描会把 GPIO4 临时当 SDA 用，恢复
+}
+
+static const gpio_num_t SPK = (gpio_num_t)SPEAKER_PIN;
+
+static const uint32_t AUTO_INTERVAL_MS = 8000;
+static bool     auto_play     = true;
+static uint32_t last_auto_ms  = 0;
+
+// ---------------------------------------------------------------- 发声层（软件翻转方波）
+static void toneBegin()
+{
+  ledcDetachPin(SPEAKER_PIN);              // 彻底脱离 LEDC
+  gpio_set_direction(SPK, GPIO_MODE_OUTPUT);
+  gpio_set_level(SPK, 0);
+}
+
+static void toneOff()
+{
+  gpio_set_level(SPK, 0);
+}
+
+// 软件翻转产生方波。freq=频率Hz，ms=持续毫秒。
+// abort_on_serial=true 时，串口来数据可提前中断（长音用）。
+static bool bitBangTone(uint32_t freq, uint32_t ms, bool abort_on_serial = false)
+{
+  if (freq < 20 || freq > 20000) return false;
+
+  ledcDetachPin(SPEAKER_PIN);
+  gpio_set_direction(SPK, GPIO_MODE_OUTPUT);
+
+  const uint32_t half_us = 500000UL / freq;              // 半周期（微秒）
+  if (half_us < 5) return false;
+  const uint32_t cycles  = (ms * 1000UL) / (2UL * half_us);
+
+  for (uint32_t i = 0; i < cycles; i++)
+  {
+    gpio_set_level(SPK, 1);
+    delayMicroseconds(half_us);
+    gpio_set_level(SPK, 0);
+    delayMicroseconds(half_us);
+
+    if (abort_on_serial && (i % 32 == 0) && Serial.available())
+    {
+      toneOff();
+      return false;
+    }
+  }
+  toneOff();
+  return true;
+}
+
+static void playTone(uint32_t freq, uint32_t ms)
+{
+  bitBangTone(freq, ms);
+  delay(45);
+}
+
+static void playStartupMelody()
+{
+  const uint16_t mel[] = {523, 659, 784, 1047};   // C5 E5 G5 C6
+  Serial.println("[tone] melody C5-E5-G5-C6 on GPIO4");
+  for (uint8_t i = 0; i < 4; i++)
+  {
+    bitBangTone(mel[i], 200);
+    digitalWrite(STATUS_LED, HIGH); delay(30); digitalWrite(STATUS_LED, LOW);
+    delay(25);
+  }
+  toneOff();
+}
+
+static void playBeep()
+{
+  Serial.println("[tone] beep 1200/1600Hz");
+  playTone(1200, 90);
+  playTone(1600, 90);
+}
+
+static void playSweep()
+{
+  Serial.println("[tone] sweep 200 -> 4000 Hz, 200ms per step");
+  for (uint32_t f = 200; f <= 4000; f += 200)
+  {
+    bitBangTone(f, 200);
+    digitalWrite(STATUS_LED, HIGH);
+    Serial.printf("[sweep] %4u Hz\n", f);
+    digitalWrite(STATUS_LED, LOW);
+  }
+  toneOff();
+  Serial.println("[tone] sweep done");
+}
+
+// GPIO4 持续直流高电平 —— 有源蜂鸣器内部自带振荡器，吃直流就会响
+static void playDcHigh()
+{
+  ledcDetachPin(SPEAKER_PIN);
+  gpio_set_direction(SPK, GPIO_MODE_OUTPUT);
+  gpio_set_level(SPK, 1);
+  Serial.println("[tone] GPIO4 = DC 3.3V for 4s");
+  Serial.println("[tone] -> ACTIVE buzzer should buzz continuously NOW");
+  Serial.println("[tone] -> passive buzzer stays silent here (it needs the square wave)");
+  delay(4000);
+  gpio_set_level(SPK, 0);
+  Serial.println("[tone] DC high released");
+}
+
+// ---------------------------------------------------------------- 自检
+// 让芯片自己读回 GPIO4 的电平：方波真的在输出，连续读就一定会出现 0/1 跳变。
+// 注意：引脚必须开「输入使能」才能读回，ledcAttachPin 会把它强制成纯输出导致读不回。
+static uint32_t countTogglesInputEnabled(uint32_t reads, uint32_t us_between)
+{
+  gpio_set_direction(SPK, GPIO_MODE_INPUT_OUTPUT);
+  uint32_t prev = gpio_get_level(SPK);
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < reads; i++)
+  {
+    if (us_between) delayMicroseconds(us_between);
+    uint32_t c = gpio_get_level(SPK);
+    if (c != prev) { n++; prev = c; }
+  }
+  return n;
+}
+
+static void runSelfTest()
+{
+  Serial.println("\n===== GPIO4 OUTPUT SELF-TEST =====");
+
+  // step 1: 数字读写回环，证明「读回」这条路是通的
+  ledcDetachPin(SPEAKER_PIN);
+  gpio_set_direction(SPK, GPIO_MODE_INPUT_OUTPUT);
+  delay(10);
+  gpio_set_level(SPK, 1); delay(5); uint32_t hi = gpio_get_level(SPK);
+  gpio_set_level(SPK, 0); delay(5); uint32_t lo = gpio_get_level(SPK);
+  const bool loopback_ok = (hi == 1 && lo == 0);
+  Serial.printf("[test] digital loopback : set1->read%u set0->read%u   %s\n",
+                hi, lo, loopback_ok ? "OK, pad is readable" : "FAIL");
+
+  // step 2: 软件翻转 200Hz，翻转 200 个周期 -> 理论 400 次跳变
+  //         必须 INPUT_OUTPUT，纯 OUTPUT 会关掉输入缓冲导致读不回
+  gpio_set_direction(SPK, GPIO_MODE_INPUT_OUTPUT);
+  uint32_t bb = 0;
+  {
+    const uint32_t half = 500000UL / 200;
+    uint32_t prev = gpio_get_level(SPK);
+    for (uint32_t i = 0; i < 200; i++)
+    {
+      gpio_set_level(SPK, 1); delayMicroseconds(half);
+      uint32_t c = gpio_get_level(SPK); if (c != prev) { bb++; prev = c; }
+      gpio_set_level(SPK, 0); delayMicroseconds(half);
+      c = gpio_get_level(SPK); if (c != prev) { bb++; prev = c; }
+    }
+  }
+  toneOff();
+
+  // step 3: LEDC 对照（已知在这块板上不出信号，留作诊断）
+  ledcSetup(0, 100, 10);
+  ledcAttachPin(SPEAKER_PIN, 0);
+  ledcWrite(0, 512);
+  uint32_t ledc_n = countTogglesInputEnabled(2400, 300);
+  ledcWrite(0, 0);
+  ledcDetachPin(SPEAKER_PIN);
+
+  Serial.printf("[test] bit-bang 200Hz   : %6u toggles  (expect ~400)\n", bb);
+  Serial.printf("[test] LEDC    100Hz    : %6u toggles\n", ledc_n);
+
+  if (!loopback_ok)
+    Serial.println("[VERDICT] read-back path broken -> cannot judge.");
+  else if (bb > 300)
+    Serial.println("[VERDICT] *** GPIO4 IS OSCILLATING -> the module is GOOD ***");
+  else
+    Serial.println("[VERDICT] GPIO4 not toggling -> hardware problem.");
+
+  if (bb > 300 && ledc_n == 0)
+    Serial.println("[VERDICT] LEDC peripheral is dead on this board -> using software square wave.\n");
+
+  Serial.println("[note] NO speaker on this module. GPIO4 only emits an electrical signal;");
+  Serial.println("       connect a buzzer or earphone to actually hear it.\n");
+
+  toneBegin();
+}
+
+// ---------------------------------------------------------------- 芯片体检
+static void printChipInfo()
+{
+  Serial.println("\n===== ESP32-S3 CHIP INFO =====");
+  Serial.printf("Model      : %s rev%d\n", ESP.getChipModel(), ESP.getChipRevision());
+  Serial.printf("CPU freq   : %u MHz  (%u cores)\n", ESP.getCpuFreqMHz(), ESP.getChipCores());
+  Serial.printf("Flash      : %u MB\n", ESP.getFlashChipSize() / (1024 * 1024));
+  Serial.printf("PSRAM      : %u MB\n", ESP.getPsramSize() / (1024 * 1024));
+  Serial.printf("Free heap  : %u bytes\n", ESP.getFreeHeap());
+  Serial.printf("Free PSRAM : %u bytes\n", ESP.getFreePsram());
+  Serial.printf("speaker    : GPIO%d  (software square wave)\n", SPEAKER_PIN);
+  Serial.printf("status led : GPIO%d\n", STATUS_LED);
+  Serial.println("==============================");
+
+  if (ESP.getPsramSize() >= 2 * 1024 * 1024)
+    Serial.println("[VERDICT] PSRAM OK -> can run esp-sr offline speech recognition\n");
+  else
+    Serial.println("[VERDICT] low PSRAM -> prefer a ready-made ASR module\n");
+}
+
+static void printHelp()
+{
+  Serial.println("\n----- S3-VOICE commands -----");
+  Serial.println("  C  scan I2C bus -> find onboard audio codec / mic / RTC chips");
+  Serial.println("  X  self-test: prove GPIO4 oscillates (needs NO external part)");
+  Serial.println("  H  GPIO4 = DC 3.3V for 4s  <- use this for an ACTIVE buzzer");
+  Serial.println("  T  melody C5-E5-G5-C6");
+  Serial.println("  B  two short beeps");
+  Serial.println("  L  10s continuous 1000Hz (send any char to stop)");
+  Serial.println("  S  sweep 200..4000 Hz");
+  Serial.println("  A  toggle auto-loop (default ON, every 8s)");
+  Serial.println("  I  chip info");
+  Serial.println("  ?  this help");
+  Serial.println("-----------------------------\n");
+}
+
+// ---------------------------------------------------------------- 主程序
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("\n\n===== S3-VOICE boot (v4, software square wave) =====");
+  Serial.printf("speaker = GPIO%d, status led = GPIO%d\n", SPEAKER_PIN, STATUS_LED);
+
+  pinMode(STATUS_LED, OUTPUT);
+  toneBegin();
+
+  printChipInfo();
+  scanI2C();
+  printHelp();
+  runSelfTest();
+  playStartupMelody();
+
+  Serial.println("[sys] ready. auto-loop ON -> a melody every 8 seconds.");
+  Serial.println("[sys] hear nothing? send X to confirm GPIO4 is really oscillating.");
+  Serial.println("[sys] still nothing after X passes -> you need a buzzer on GPIO4.\n");
+}
+
+void loop()
+{
+  const uint32_t now = millis();
+
+  static uint32_t last_blink = 0;
+  static bool led_on = false;
+  if (now - last_blink >= (led_on ? 100 : 900))
+  {
+    last_blink = now;
+    led_on = !led_on;
+    digitalWrite(STATUS_LED, led_on);
+  }
+
+  if (auto_play && now - last_auto_ms >= AUTO_INTERVAL_MS)
+  {
+    last_auto_ms = now;
+    playStartupMelody();
+  }
+
+  if (Serial.available())
+  {
+    String s = Serial.readStringUntil('\n');
+    s.trim();
+    if (s.length() == 0) return;
+
+    Serial.printf("[echo] %s\n", s.c_str());
+
+    if      (s.equalsIgnoreCase("T")) { last_auto_ms = now; playStartupMelody(); }
+    else if (s.equalsIgnoreCase("B")) { last_auto_ms = now; playBeep(); }
+    else if (s.equalsIgnoreCase("I")) { printChipInfo(); }
+    else if (s.equalsIgnoreCase("?")) { printHelp(); }
+    else if (s.equalsIgnoreCase("X")) { last_auto_ms = now; runSelfTest(); }
+    else if (s.equalsIgnoreCase("C")) { last_auto_ms = now; scanI2C(); }
+    else if (s.equalsIgnoreCase("H")) { last_auto_ms = now; playDcHigh(); }
+    else if (s.equalsIgnoreCase("S")) { last_auto_ms = now; playSweep(); }
+    else if (s.equalsIgnoreCase("A"))
+    {
+      auto_play = !auto_play;
+      Serial.printf("[sys] auto-loop = %s\n", auto_play ? "ON" : "OFF");
+    }
+    else if (s.equalsIgnoreCase("L"))
+    {
+      last_auto_ms = now;
+      Serial.println("[tone] START 1000Hz for 10s -> send any char to stop early");
+      bool done = bitBangTone(1000, 10000, true);
+      Serial.printf("[tone] %s\n", done ? "finished" : "interrupted");
+    }
+  }
+}
