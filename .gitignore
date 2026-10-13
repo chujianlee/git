@@ -21,3 +21,15 @@ s3-voice/*-now.txt
 s3-voice/pnp-*.txt
 3.Software/Vscode/Vscode-Shibo-Robot-PIOProj-main/
 
+# Git/GitHub 安全规则：根目录和子目录里的凭据与下载依赖均不提交。
+.env
+.env.*
+.git-credentials
+id_rsa
+id_ed25519
+*.key
+*.pem
+*.p12
+*.pfx
+node_modules/
+
